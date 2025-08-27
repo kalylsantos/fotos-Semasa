@@ -1,0 +1,7 @@
+{
+  "name": "Field Scan Analyzer",
+  "description": "An intelligent application to capture and analyze field scans using your device's camera and advanced AI. Instantly get descriptive insights from your captured images.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
