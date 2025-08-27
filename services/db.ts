@@ -1,74 +1,43 @@
-import { openDB, DBSchema, IDBPDatabase } from 'idb';
 import { PhotoRecord, TaskReport } from '../types';
 
-const DB_NAME = 'TaskPhotoDB';
-const DB_VERSION = 1;
-const STORE_NAME = 'photos';
-
-interface TaskPhotoDB extends DBSchema {
-  [STORE_NAME]: {
-    key: number;
-    value: PhotoRecord;
-    indexes: { 'timestamp': string; 'taskCode': string };
-  };
-}
-
-let dbPromise: Promise<IDBPDatabase<TaskPhotoDB>> | null = null;
+// =================================================================================
+// IMPORTANT: This is a placeholder file.
+// IndexedDB is a browser API and does not exist in React Native.
+// You must replace this implementation with a proper native database solution.
+// Recommended libraries: WatermelonDB (for complex relational data) or Realm.
+// =================================================================================
 
 export function initDB() {
-  if (!dbPromise) {
-    dbPromise = openDB<TaskPhotoDB>(DB_NAME, DB_VERSION, {
-      upgrade(db) {
-        const store = db.createObjectStore(STORE_NAME, {
-          keyPath: 'id',
-          autoIncrement: true,
-        });
-        store.createIndex('timestamp', 'timestamp');
-        store.createIndex('taskCode', 'taskCode');
-      },
-    });
-  }
-  return dbPromise;
+  console.warn("Database not implemented. Using mock data.");
+  // In a real app, you would initialize your WatermelonDB or Realm connection here.
 }
 
-export async function addPhoto(photo: PhotoRecord) {
-  const db = await initDB();
-  return db.add(STORE_NAME, photo);
-}
-
-const getDailyPhotoRange = (date: string) => {
-  const startOfDay = new Date(date);
-  startOfDay.setHours(0, 0, 0, 0);
-  
-  const endOfDay = new Date(date);
-  endOfDay.setHours(23, 59, 59, 999);
-
-  return IDBKeyRange.bound(startOfDay.toISOString(), endOfDay.toISOString());
+export async function addPhoto(photo: PhotoRecord): Promise<void> {
+  console.log('Mock DB: Adding photo', photo.filename);
+  // In a real app:
+  // const db = getDB();
+  // await db.write(async () => {
+  //   await db.collections.get('photos').create(p => {
+  //     p.taskCode = photo.taskCode;
+  //     p.filename = photo.filename;
+  //     p.timestamp = photo.timestamp;
+  //     p.path = photo.data; // Store path, not blob
+  //     p.deviceId = photo.deviceId;
+  //     p.latitude = photo.latitude;
+  //     p.longitude = photo.longitude;
+  //   });
+  // });
+  return Promise.resolve();
 }
 
 export async function getPhotosForReport(date: string): Promise<PhotoRecord[]> {
-    const db = await initDB();
-    const range = getDailyPhotoRange(date);
-    return db.getAllFromIndex(STORE_NAME, 'timestamp', range);
+    console.warn("getPhotosForReport is not implemented. Returning empty array.");
+    // In a real app, you would query your database for records within the date range.
+    return Promise.resolve([]);
 }
 
-
 export async function getDailyReport(date: string): Promise<TaskReport[]> {
-  const allPhotos = await getPhotosForReport(date);
-
-  const tasks: { [key: string]: { taskCode: string; photoCount: number } } = {};
-
-  for (const photo of allPhotos) {
-    if (!tasks[photo.taskCode]) {
-      tasks[photo.taskCode] = {
-        taskCode: photo.taskCode,
-        photoCount: 0,
-      };
-    }
-    tasks[photo.taskCode].photoCount++;
-  }
-  
-  // Sort by task code for consistent ordering
-  const sortedReports = Object.values(tasks).sort((a, b) => a.taskCode.localeCompare(b.taskCode));
-  return sortedReports.map(task => ({...task, photos: []})); // photos array is not needed for summary view
+  console.warn("getDailyReport is not implemented. Returning empty array.");
+  // In a real app, you would perform an aggregation query on your database.
+  return Promise.resolve([]);
 }

@@ -1,4 +1,3 @@
-
 export enum AppState {
   HOME,
   SCANNING,
@@ -11,14 +10,13 @@ export interface PhotoRecord {
   taskCode: string;
   filename: string;
   timestamp: string;
-  data: Blob;
-  latitude?: number; // Optional, in case geolocation fails
-  longitude?: number; // Optional
-  deviceId: string; // Should always be present
+  data: string; // In React Native, this will be the file path, not a Blob
+  latitude?: number;
+  longitude?: number;
+  deviceId: string;
 }
 
 export interface TaskReport {
     taskCode: string;
     photoCount: number;
-    photos?: PhotoRecord[]; // Photos are not needed for the summary list, only for export
 }

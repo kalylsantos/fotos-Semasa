@@ -1,413 +1,533 @@
-
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { AppState, PhotoRecord, TaskReport } from './types';
-import { initDB, addPhoto, getDailyReport, getPhotosForReport } from './services/db';
-// Fix: Removed NotFoundException as it is not exported from @zxing/browser.
-// Will use error name check instead.
-import { BrowserMultiFormatReader } from '@zxing/browser';
-import JSZip from 'jszip';
-import { CameraIcon, BarcodeScannerIcon, PencilSquareIcon, DocumentTextIcon, XMarkIcon } from './components/Icons';
+import {
+  SafeAreaView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  View,
+  TouchableOpacity,
+  Modal,
+  TextInput,
+  Dimensions,
+  Platform,
+  PermissionsAndroid,
+  Alert,
+  ActivityIndicator,
+  FlatList,
+  Animated,
+  Easing,
+} from 'react-native';
+// FIX: Changed to default import for CameraKitCamera as it is a default export.
+import CameraKitCamera from 'react-native-camera-kit';
+import Geolocation from '@react-native-community/geolocation';
+import ImageEditor from 'react-native-image-editor';
+import { v4 as uuidv4 } from 'uuid';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import Share from 'react-native-share';
+import RNFS from 'react-native-fs';
+import { zip } from 'react-native-zip-archive';
 
-// Initialize the database when the app loads
-initDB();
+// Note: DB logic needs to be replaced with a native solution like WatermelonDB or Realm.
+// This is a placeholder for the logic.
+import { addPhoto, getDailyReport, getPhotosForReport } from './services/db';
+import { AppState, PhotoRecord, TaskReport } from './types';
+import { BarcodeScannerIcon, CameraIcon, ChevronLeftIcon, DocumentTextIcon, PencilSquareIcon, XMarkIcon } from './components/Icons';
 
 // --- HELPERS ---
-
-/**
- * Gets a persistent, anonymous device identifier from local storage, creating one if it doesn't exist.
- * This helps in tracking which device took which photo.
- */
-const getDeviceId = (): string => {
-  let deviceId = localStorage.getItem('device-id');
+const getDeviceId = async (): Promise<string> => {
+  let deviceId = await AsyncStorage.getItem('device-id');
   if (!deviceId) {
-    // A simple, non-invasive way to generate a unique ID
-    deviceId = `device_${Math.random().toString(36).substring(2, 11)}`;
-    localStorage.setItem('device-id', deviceId);
+    deviceId = `device_${uuidv4()}`;
+    await AsyncStorage.setItem('device-id', deviceId);
   }
   return deviceId;
 };
 
-/**
- * Wraps the Geolocation API in a Promise for easier async/await usage.
- */
+const requestLocationPermission = async () => {
+  if (Platform.OS === 'ios') {
+    // FIX: `requestAuthorization` does not take arguments. The permission type is configured in Info.plist.
+    Geolocation.requestAuthorization();
+    return true;
+  }
+  try {
+    const granted = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      {
+        title: 'Location Permission',
+        message: 'This app needs access to your location to geotag photos.',
+        buttonNeutral: 'Ask Me Later',
+        buttonNegative: 'Cancel',
+        buttonPositive: 'OK',
+      },
+    );
+    return granted === PermissionsAndroid.RESULTS.GRANTED;
+  } catch (err) {
+    console.warn(err);
+    return false;
+  }
+};
+
 const getCurrentLocation = (): Promise<{ latitude: number; longitude: number }> => {
   return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) {
-      return reject(new Error('Geolocation is not supported by your browser.'));
-    }
-    navigator.geolocation.getCurrentPosition(
+    Geolocation.getCurrentPosition(
       (position) => resolve({
         latitude: position.coords.latitude,
         longitude: position.coords.longitude,
       }),
-      (error) => reject(error)
+      (error) => reject(error),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 },
     );
   });
 };
 
-
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.HOME);
   const [taskCode, setTaskCode] = useState<string>('');
-  const [photos, setPhotos] = useState<PhotoRecord[]>([]);
+  const [photos, setPhotos] = useState<PhotoRecord[]>([]); // We use the path for native
   const [error, setError] = useState<string>('');
   const [report, setReport] = useState<TaskReport[]>([]);
   const [reportDate, setReportDate] = useState(new Date().toISOString().split('T')[0]);
   const [isManualEntryOpen, setManualEntryOpen] = useState(false);
+  const [manualTaskCode, setManualTaskCode] = useState('');
   const [isCapturing, setIsCapturing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const codeReader = useRef(new BrowserMultiFormatReader());
-  const streamRef = useRef<MediaStream | null>(null);
-  const deviceIdRef = useRef<string>(getDeviceId()); // Get device ID on initial render
+  const cameraRef = useRef<any>(null); // Ref for CameraKitCamera
+  const deviceIdRef = useRef<string>('');
+  const scannerAnimation = useRef(new Animated.Value(0)).current;
 
-  const stopCamera = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    // Fix: Cast to 'any' to bypass a potential TypeScript typing issue where 'reset' is not found.
-    // The method is expected to exist at runtime for cleaning up the scanner state.
-    (codeReader.current as any).reset();
+
+  // Initial setup effect
+  useEffect(() => {
+    const setup = async () => {
+      deviceIdRef.current = await getDeviceId();
+      const cameraPermission = await CameraKitCamera.requestDeviceCameraPermissions();
+      setHasCameraPermission(cameraPermission);
+      if (!cameraPermission) {
+        setError('Camera permission is required to use this app.');
+      }
+      await requestLocationPermission();
+    };
+    setup();
   }, []);
   
-  const startCamera = useCallback(async (videoElement: HTMLVideoElement) => {
-    if (streamRef.current) return streamRef.current; // Don't restart if already running
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: 'environment' },
-            audio: false,
-        });
-        videoElement.srcObject = stream;
-        streamRef.current = stream;
-        await videoElement.play();
-        return stream;
-    } catch (err) {
-        console.error("Camera access error:", err);
-        setError("Could not access camera. Please check permissions.");
-        setAppState(AppState.HOME);
-        return null;
+  // Scanner animation effect
+  useEffect(() => {
+    if (appState === AppState.SCANNING) {
+      const animation = Animated.loop(
+        Animated.sequence([
+          Animated.timing(scannerAnimation, {
+            toValue: 1,
+            duration: 2500,
+            easing: Easing.inOut(Easing.ease),
+            useNativeDriver: true,
+          }),
+          Animated.timing(scannerAnimation, {
+            toValue: 0,
+            duration: 2500,
+            easing: Easing.inOut(Easing.ease),
+            useNativeDriver: true,
+          }),
+        ])
+      );
+      animation.start();
+      return () => animation.stop();
     }
-  }, []);
+  }, [appState, scannerAnimation]);
 
 
-  const handleStartScan = useCallback(async () => {
-    setAppState(AppState.SCANNING);
-    setError('');
-    if (videoRef.current) {
-      const stream = await startCamera(videoRef.current);
-      if (stream) {
-        try {
-            // No need to await, decodeFromStream handles the loop
-            codeReader.current.decodeFromStream(stream, videoRef.current, (result, err) => {
-              // Fix: Refactored logic on successful scan.
-              // Instead of calling reset() directly which caused a frozen camera,
-              // we now call stopCamera() for proper cleanup before transitioning state.
-              if (result) {
-                stopCamera();
-                setTaskCode(result.getText());
-                setPhotos([]);
-                setAppState(AppState.CAPTURE_PHOTO);
-              }
-              // Fix: Check error by its name property as NotFoundException class is not available for import.
-              if (err && err.name !== 'NotFoundException') {
-                 console.error(err);
-              }
-            });
-        } catch (err) {
-            console.error('Scan error:', err);
-            if (appState === AppState.SCANNING) { // Only set error if we are still in scanning mode
-              setError('Failed to start scanner.');
-              setAppState(AppState.HOME);
-              stopCamera();
-            }
-        }
-      }
+  const handleStartScan = () => {
+    if (hasCameraPermission) {
+      setAppState(AppState.SCANNING);
+      setError('');
+    } else {
+      Alert.alert("Permission Denied", "Cannot start scanner without camera permission.");
     }
-  }, [startCamera, stopCamera, appState]);
-  
-  const handleManualSubmit = (code: string) => {
-      if(code.trim()) {
-        setTaskCode(code.trim());
-        setPhotos([]);
-        setManualEntryOpen(false);
-        setAppState(AppState.CAPTURE_PHOTO);
-      }
   };
 
+  const onBarcodeScan = (event: { nativeEvent: { codeStringValue: string } }) => {
+    if (appState === AppState.SCANNING) {
+      const code = event.nativeEvent.codeStringValue;
+      console.log('Barcode scanned:', code);
+      setTaskCode(code);
+      setPhotos([]);
+      setAppState(AppState.CAPTURE_PHOTO);
+    }
+  };
+  
+  const handleManualSubmit = (code: string) => {
+    if (code.trim()) {
+      setTaskCode(code.trim());
+      setPhotos([]);
+      setManualEntryOpen(false);
+      setManualTaskCode('');
+      setAppState(AppState.CAPTURE_PHOTO);
+    }
+  };
 
-  const handleTakePhoto = useCallback(async () => {
-    if (videoRef.current && canvasRef.current && !isCapturing) {
+  const handleTakePhoto = async () => {
+    if (cameraRef.current && !isCapturing) {
       setIsCapturing(true);
-      // Haptic feedback for modern Android devices
-      if (navigator.vibrate) {
-        navigator.vibrate(100);
-      }
-
-      let location: { latitude: number; longitude: number } | null = null;
       try {
-        location = await getCurrentLocation();
-      } catch (geoError) {
-        console.warn('Could not get geolocation:', geoError);
-        // Proceed without location data. The user will see "Location: N/A" on the watermark.
-      }
-
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const context = canvas.getContext('2d');
-
-      if (context) {
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
+        const image = await cameraRef.current.capture();
+        const imagePath = Platform.OS === 'android' ? `file://${image.uri}` : image.uri;
+        
+        let location: { latitude: number; longitude: number } | null = null;
+        try {
+          location = await getCurrentLocation();
+        } catch (geoError) {
+          console.warn('Could not get geolocation:', geoError);
+        }
+        
         const now = new Date();
         const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`;
         const deviceId = deviceIdRef.current;
         
-        // --- Watermark Rendering ---
-        const fontSize = Math.max(20, Math.floor(canvas.width / 50));
-        context.font = `bold ${fontSize}px Inter, sans-serif`;
-        context.fillStyle = 'rgba(255, 255, 255, 0.9)';
-        context.strokeStyle = 'rgba(0, 0, 0, 0.9)';
-        context.lineWidth = 4;
-        
-        const x = 20;
-        let y = canvas.height - 20;
-        const lineHeight = fontSize * 1.2;
-
         const locationLine = location ? `Lat: ${location.latitude.toFixed(5)}, Lon: ${location.longitude.toFixed(5)}` : 'Location: N/A';
         const timeLine = `Time: ${timestamp}`;
         const infoLine = `Task: ${taskCode} | Device: ${deviceId}`;
+        
+        const textStyle = { color: '#FFFFFFCC', fontName: 'Arial', fontSize: 40 };
+        const position = { X: 40, Y: 'bottom-20' };
 
-        // Draw lines from bottom up to position them correctly at the bottom-left corner
-        context.strokeText(locationLine, x, y);
-        context.fillText(locationLine, x, y);
-        y -= lineHeight;
-        context.strokeText(timeLine, x, y);
-        context.fillText(timeLine, x, y);
-        y -= lineHeight;
-        context.strokeText(infoLine, x, y);
-        context.fillText(infoLine, x, y);
+        const watermarkedImagePath = await ImageEditor.addText(imagePath, [
+            { text: infoLine, style: textStyle, position: { ...position, Y: 'bottom-120'} },
+            { text: timeLine, style: textStyle, position: { ...position, Y: 'bottom-70'} },
+            { text: locationLine, style: textStyle, position: position },
+        ]);
 
-        canvas.toBlob(async (blob) => {
-          if (blob) {
-            const photoIndex = photos.length + 1;
-            const filename = `${taskCode}_(${photoIndex}).jpg`;
-            const newRecord: PhotoRecord = { 
-                taskCode, 
-                filename, 
-                timestamp: now.toISOString(), 
-                data: blob,
-                deviceId: deviceId,
-                latitude: location?.latitude,
-                longitude: location?.longitude
-            };
-            await addPhoto(newRecord);
-            setPhotos(prevPhotos => [...prevPhotos, newRecord]);
-          }
-        }, 'image/jpeg', 0.9);
+        const photoIndex = photos.length + 1;
+        const filename = `${taskCode}_(${photoIndex}).jpg`;
+        const newPath = `${RNFS.DocumentDirectoryPath}/${filename}`;
+
+        await RNFS.moveFile(watermarkedImagePath, newPath);
+
+        const newRecord: PhotoRecord = {
+          taskCode,
+          filename,
+          timestamp: now.toISOString(),
+          data: newPath,
+          deviceId,
+          latitude: location?.latitude,
+          longitude: location?.longitude
+        };
+        await addPhoto(newRecord);
+        setPhotos(prevPhotos => [...prevPhotos, newRecord]);
+
+      } catch (e) {
+        console.error('Failed to take photo', e);
+        setError('Could not capture image.');
+      } finally {
+        setIsCapturing(false);
       }
-      setTimeout(() => setIsCapturing(false), 200); // Reset after flash effect
     }
-  }, [taskCode, photos, isCapturing]);
+  };
 
-  const handleViewReports = useCallback(async () => {
+  const handleFinishSession = () => {
+    setTaskCode('');
+    setPhotos([]);
+    setAppState(AppState.HOME);
+  };
+
+  const handleViewReports = async () => {
     setAppState(AppState.REPORTS);
     const dailyReport = await getDailyReport(reportDate);
-    setReport(dailyReport);
-  }, [reportDate]);
-
-  const handleDateChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newDate = e.target.value;
-    setReportDate(newDate);
-    const dailyReport = await getDailyReport(newDate);
     setReport(dailyReport);
   };
   
   const handleExportReport = async () => {
-      if (report.length === 0 || isExporting) return;
-      setIsExporting(true);
-      
-      const zip = new JSZip();
-      const allPhotosForDay = await getPhotosForReport(reportDate);
-      
-      const photosByTask: { [taskCode: string]: PhotoRecord[] } = {};
-      allPhotosForDay.forEach(photo => {
-        if (!photosByTask[photo.taskCode]) {
-            photosByTask[photo.taskCode] = [];
+    if (report.length === 0 || isExporting) return;
+    setIsExporting(true);
+    
+    try {
+        const allPhotosForDay = await getPhotosForReport(reportDate);
+        if (allPhotosForDay.length === 0) {
+            Alert.alert("No Photos", "There are no photos to export for the selected date.");
+            return;
         }
-        photosByTask[photo.taskCode].push(photo);
-      });
 
-      Object.keys(photosByTask).forEach(code => {
-          const folder = zip.folder(code);
-          photosByTask[code].forEach(photo => {
-              folder.file(photo.filename, photo.data);
-          });
-      });
+        const tempDir = `${RNFS.CachesDirectoryPath}/export_${reportDate}`;
+        await RNFS.mkdir(tempDir);
 
-      const zipBlob = await zip.generateAsync({ type: 'blob' });
-      const filename = `report_${reportDate}.zip`;
+        for (const photo of allPhotosForDay) {
+            const taskFolder = `${tempDir}/${photo.taskCode}`;
+            if (!(await RNFS.exists(taskFolder))) {
+              await RNFS.mkdir(taskFolder);
+            }
+            await RNFS.copyFile(photo.data, `${taskFolder}/${photo.filename}`);
+        }
+        
+        const zipPath = `${RNFS.DocumentDirectoryPath}/report_${reportDate}.zip`;
+        if (await RNFS.exists(zipPath)) {
+            await RNFS.unlink(zipPath);
+        }
+        await zip(tempDir, zipPath);
+        await RNFS.unlink(tempDir);
 
-      // Use Web Share API for a native Android experience
-      if (navigator.share && navigator.canShare({ files: [new File([zipBlob], filename)] })) {
-          try {
-              const fileToShare = new File([zipBlob], filename, { type: 'application/zip' });
-              await navigator.share({
-                  title: `Task Report ${reportDate}`,
-                  text: `Attached is the task photo report for ${reportDate}.`,
-                  files: [fileToShare],
-              });
-          } catch (error) {
-              console.error('Sharing failed:', error);
-          }
-      } else {
-          // Fallback for browsers/devices that don't support Web Share
-          const a = document.createElement('a');
-          const url = URL.createObjectURL(zipBlob);
-          a.href = url;
-          a.download = filename;
-          document.body.appendChild(a);
-          a.click();
-          window.URL.revokeObjectURL(url);
-          document.body.removeChild(a);
-      }
-      setIsExporting(false);
-  };
+        await Share.open({
+            url: `file://${zipPath}`,
+            title: 'Share Report',
+            message: `Task photo report for ${reportDate}`,
+            type: 'application/zip'
+        });
 
-  useEffect(() => {
-    if ((appState === AppState.SCANNING || appState === AppState.CAPTURE_PHOTO) && videoRef.current) {
-        startCamera(videoRef.current);
-    } else {
-        stopCamera();
+    } catch (e) {
+        console.error("Export failed:", e);
+        Alert.alert("Export Error", "Could not generate or share the report zip file.");
+    } finally {
+        setIsExporting(false);
     }
-    // Cleanup on unmount
-    return () => stopCamera();
-  }, [appState, startCamera, stopCamera]);
+  };
 
   const renderScreen = () => {
     switch (appState) {
       case AppState.SCANNING:
+        const scannerLineStyle = {
+          transform: [
+            {
+              translateY: scannerAnimation.interpolate({
+                inputRange: [0, 1],
+                outputRange: [-height * 0.15, height * 0.15],
+              }),
+            },
+          ],
+        };
         return (
-          <div className="text-center">
-            <h2 className="text-2xl font-semibold mb-4">Scan Task Barcode</h2>
-            <div className="relative aspect-video bg-slate-900 rounded-xl overflow-hidden border-2 border-slate-700">
-                <video ref={videoRef} playsInline className="w-full h-full object-cover"></video>
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                    <div className="w-3/4 h-1/2 border-4 border-dashed border-cyan-400 rounded-lg opacity-75 animate-pulse"></div>
-                </div>
-            </div>
-            <button onClick={() => setAppState(AppState.HOME)} className="mt-4 bg-slate-600 text-white font-semibold px-6 py-3 rounded-lg flex items-center justify-center gap-2 mx-auto">
-              <XMarkIcon className="w-6 h-6"/> Cancel
-            </button>
-          </div>
+          <View style={styles.fullScreen}>
+            <CameraKitCamera
+              ref={cameraRef}
+              style={StyleSheet.absoluteFill}
+              scanBarcode={true}
+              onReadCode={onBarcodeScan}
+              cameraOptions={{ flashMode: 'auto', focusMode: 'on', zoomMode: 'on' }}
+            />
+            <View style={styles.scannerOverlay}>
+              <Text style={styles.scannerText}>Position barcode inside the frame</Text>
+              <View style={styles.scannerBox}>
+                  <View style={[styles.scannerCorner, styles.topLeft]} />
+                  <View style={[styles.scannerCorner, styles.topRight]} />
+                  <View style={[styles.scannerCorner, styles.bottomLeft]} />
+                  <View style={[styles.scannerCorner, styles.bottomRight]} />
+                  <Animated.View style={[styles.scannerLine, scannerLineStyle]} />
+              </View>
+            </View>
+            <TouchableOpacity style={styles.closeButton} onPress={() => setAppState(AppState.HOME)}>
+              <XMarkIcon size={24} color="#E5E7EB" />
+            </TouchableOpacity>
+          </View>
         );
       case AppState.CAPTURE_PHOTO:
         return (
-          <div className="flex flex-col h-[80vh] md:h-auto">
-            <h2 className="text-xl font-semibold mb-2 text-center flex-shrink-0">Task Code: <span className="text-cyan-400">{taskCode}</span></h2>
-            <div className="relative flex-grow aspect-video bg-slate-900 rounded-xl overflow-hidden border-2 border-slate-700 mb-4">
-                <video ref={videoRef} playsInline className="w-full h-full object-cover"></video>
-                <canvas ref={canvasRef} className="hidden"></canvas>
-                {/* Shutter flash effect */}
-                <div className={`absolute inset-0 bg-white transition-opacity duration-200 ${isCapturing ? 'opacity-70' : 'opacity-0'} pointer-events-none`}></div>
-            </div>
-            <div className="flex-shrink-0 flex justify-around items-center gap-4">
-                <button onClick={() => { setTaskCode(''); setPhotos([]); setAppState(AppState.HOME); }} className="bg-slate-600 text-white font-semibold px-4 py-3 rounded-lg flex items-center gap-2">
-                    <XMarkIcon className="w-6 h-6"/> Finish
-                </button>
-                <button onClick={handleTakePhoto} className="bg-cyan-600 text-white font-bold p-4 rounded-full flex items-center gap-3 text-lg ring-4 ring-cyan-600/50 hover:bg-cyan-500 transition-colors">
-                    <CameraIcon className="w-8 h-8"/>
-                </button>
-                 <div className="text-center font-mono text-lg bg-slate-700/50 rounded-lg px-4 py-2 w-24">
-                    <span className="text-slate-400 block text-xs">Photos</span>
-                    <span className="text-2xl font-bold">{photos.length}</span>
-                 </div>
-            </div>
-          </div>
+          <View style={styles.fullScreen}>
+            <CameraKitCamera ref={cameraRef} style={StyleSheet.absoluteFill} />
+            {isCapturing && <View style={styles.flashEffect} />}
+            <View style={styles.captureOverlay}>
+              <View style={styles.topBar}>
+                <View style={styles.taskCodePill}>
+                    <Text style={styles.taskCodeText}>{taskCode}</Text>
+                </View>
+              </View>
+              <View style={styles.bottomBar}>
+                <TouchableOpacity style={styles.utilityButton} onPress={handleFinishSession}>
+                   <XMarkIcon size={24} color="#E5E7EB" />
+                   <Text style={styles.utilityButtonText}>Finish</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.captureButton} onPress={handleTakePhoto} disabled={isCapturing} />
+                <View style={styles.photoCountContainer}>
+                  <Text style={styles.photoCount}>{photos.length}</Text>
+                  <Text style={styles.photoCountLabel}>photos</Text>
+                </View>
+              </View>
+            </View>
+          </View>
         );
       case AppState.REPORTS:
         return (
-          <div className="w-full">
-            <div className="flex justify-between items-center mb-4">
-                <h2 className="text-2xl font-semibold">Daily Report</h2>
-                <button onClick={() => setAppState(AppState.HOME)} className="bg-slate-600 text-white font-semibold px-4 py-2 rounded-lg flex items-center gap-2">
-                    <XMarkIcon className="w-5 h-5"/> Close
-                </button>
-            </div>
-            <div className="mb-4">
-                <label htmlFor="reportDate" className="block text-sm font-medium text-slate-300 mb-1">Select Date:</label>
-                <input type="date" id="reportDate" value={reportDate} onChange={handleDateChange} className="bg-slate-700 border border-slate-600 rounded-lg p-2 w-full max-w-xs" />
-            </div>
-            {report.length > 0 ? (
-                <div className="bg-slate-800 rounded-lg p-4">
-                    <ul>
-                        {report.map(task => (
-                            <li key={task.taskCode} className="flex justify-between items-center py-2 border-b border-slate-700 last:border-b-0">
-                                <span className="font-medium">Task Code: <span className="text-cyan-400">{task.taskCode}</span></span>
-                                <span className="text-slate-400">{task.photoCount} photo(s)</span>
-                            </li>
-                        ))}
-                    </ul>
-                    <button onClick={handleExportReport} disabled={isExporting} className="mt-6 w-full bg-teal-500 text-white font-semibold px-6 py-3 rounded-lg flex items-center justify-center gap-2 disabled:bg-teal-800 disabled:cursor-not-allowed">
-                        {isExporting ? 'Exporting...' : 'Export & Share Report'}
-                    </button>
-                </div>
-            ) : (
-                <p className="text-center text-slate-400 py-8">No tasks recorded for this day.</p>
-            )}
-          </div>
+           <View style={styles.container}>
+                <View style={styles.header}>
+                    <TouchableOpacity style={styles.backButton} onPress={() => setAppState(AppState.HOME)}>
+                        <ChevronLeftIcon size={24} color="#E5E7EB" />
+                    </TouchableOpacity>
+                    <Text style={styles.title}>Daily Report</Text>
+                    <View style={{width: 40}} />
+                </View>
+                <Text style={styles.dateLabel}>Report for: {reportDate}</Text>
+                {/* Note: A proper date picker component should be used here */}
+                <FlatList
+                    data={report}
+                    keyExtractor={item => item.taskCode}
+                    renderItem={({ item }) => (
+                        <View style={styles.reportCard}>
+                            <DocumentTextIcon size={32} color="#818CF8" />
+                            <View style={styles.reportCardContent}>
+                                <Text style={styles.reportCardTitle}>Task Code</Text>
+                                <Text style={styles.reportCardValue}>{item.taskCode}</Text>
+                            </View>
+                            <View style={styles.reportCardCount}>
+                                <Text style={styles.reportCardValue}>{item.photoCount}</Text>
+                            </View>
+                        </View>
+                    )}
+                    ListEmptyComponent={<Text style={styles.emptyText}>No tasks recorded for this day.</Text>}
+                    contentContainerStyle={{paddingBottom: 100}}
+                />
+                <TouchableOpacity 
+                    style={[styles.fab, report.length === 0 && styles.fabDisabled]} 
+                    onPress={handleExportReport} 
+                    disabled={isExporting || report.length === 0}
+                >
+                    {isExporting ? <ActivityIndicator color="#111827" /> : <Text style={styles.fabText}>Export</Text>}
+                </TouchableOpacity>
+            </View>
         );
       default: // HOME
         return (
-          <div className="text-center">
-            <h1 className="text-4xl lg:text-5xl font-bold text-white tracking-tight">Task Photo Logger</h1>
-            <p className="text-slate-400 mt-2 text-lg mb-8">Log completed tasks with watermarked photos.</p>
-            {error && <p className="bg-red-900/50 text-red-300 border border-red-700 rounded-lg p-3 mb-6">{error}</p>}
-            <div className="flex flex-col sm:flex-row gap-4 justify-center">
-                <button onClick={handleStartScan} className="bg-cyan-600 text-white font-semibold px-6 py-4 rounded-lg flex items-center justify-center gap-3 text-lg">
-                    <BarcodeScannerIcon className="w-7 h-7"/> Scan Task Code
-                </button>
-                <button onClick={() => setManualEntryOpen(true)} className="bg-slate-600 text-white font-semibold px-6 py-4 rounded-lg flex items-center justify-center gap-3 text-lg">
-                    <PencilSquareIcon className="w-7 h-7"/> Enter Code Manually
-                </button>
-            </div>
-             <button onClick={handleViewReports} className="mt-6 text-cyan-400 hover:text-cyan-300 font-semibold flex items-center justify-center gap-2 mx-auto">
-                <DocumentTextIcon className="w-6 h-6"/> View Daily Reports
-            </button>
-          </div>
+          <View style={styles.container}>
+            <View style={styles.homeHeader}>
+                <CameraIcon size={48} color="#818CF8" />
+                <Text style={styles.mainTitle}>Field Scan Pro</Text>
+                <Text style={styles.tagline}>Capture. Watermark. Report.</Text>
+            </View>
+            
+            {error && <Text style={styles.errorText}>{error}</Text>}
+
+            <View style={styles.homeActions}>
+                <TouchableOpacity style={styles.actionCardPrimary} onPress={handleStartScan}>
+                    <BarcodeScannerIcon color="#111827" size={32} />
+                    <Text style={styles.actionCardTitlePrimary}>Scan Task Code</Text>
+                    <Text style={styles.actionCardSubtitle}>Use camera to scan a barcode</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.actionCardSecondary} onPress={() => setManualEntryOpen(true)}>
+                    <PencilSquareIcon color="#E5E7EB" size={24} />
+                    <Text style={styles.actionCardTitleSecondary}>Enter Manually</Text>
+                </TouchableOpacity>
+            </View>
+            
+            <TouchableOpacity style={styles.reportsLink} onPress={handleViewReports}>
+              <DocumentTextIcon color="#818CF8" size={20}/>
+              <Text style={styles.reportsLinkText}>View Daily Reports</Text>
+            </TouchableOpacity>
+          </View>
         );
     }
   };
 
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center p-4 lg:p-8 font-sans">
-      <div className="w-full max-w-2xl mx-auto bg-slate-800/50 rounded-2xl shadow-2xl p-6 md:p-8 border border-slate-700 backdrop-blur-sm">
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" backgroundColor={styles.safeArea.backgroundColor} />
         {renderScreen()}
-      </div>
-      {isManualEntryOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div className="bg-slate-800 border border-slate-700 rounded-lg p-6 w-full max-w-sm">
-                <h3 className="text-xl font-semibold mb-4">Enter Task Code</h3>
-                <form onSubmit={(e) => {
-                    e.preventDefault();
-                    const code = (e.target as HTMLFormElement).elements.namedItem('taskCodeInput') as HTMLInputElement;
-                    handleManualSubmit(code.value);
-                }}>
-                    <input name="taskCodeInput" type="text" autoFocus className="bg-slate-700 border border-slate-600 rounded-lg p-2 w-full mb-4" placeholder="e.g., TSK-12345"/>
-                    <div className="flex justify-end gap-3">
-                        <button type="button" onClick={() => setManualEntryOpen(false)} className="bg-slate-600 text-white font-semibold px-4 py-2 rounded-lg">Cancel</button>
-                        <button type="submit" className="bg-cyan-600 text-white font-semibold px-4 py-2 rounded-lg">Submit</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-      )}
-    </main>
+        <Modal
+          visible={isManualEntryOpen}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setManualEntryOpen(false)}
+        >
+          <View style={styles.modalBackdrop}>
+            <View style={styles.modalContainer}>
+              <Text style={styles.modalTitle}>Enter Task Code</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="e.g., TSK-12345"
+                placeholderTextColor="#9CA3AF"
+                autoFocus
+                value={manualTaskCode}
+                onChangeText={setManualTaskCode}
+                onSubmitEditing={() => handleManualSubmit(manualTaskCode)}
+              />
+              <View style={styles.modalActions}>
+                <TouchableOpacity style={styles.modalButtonSecondary} onPress={() => setManualEntryOpen(false)}>
+                  <Text style={styles.modalButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                 <TouchableOpacity style={styles.modalButtonPrimary} onPress={() => handleManualSubmit(manualTaskCode)}>
+                  <Text style={styles.modalButtonPrimaryText}>Submit</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+    </SafeAreaView>
   );
 };
+
+const { width, height } = Dimensions.get('window');
+const accentColor = '#22D3EE';
+const primaryBackgroundColor = '#111827';
+const componentBackgroundColor = '#1F293B';
+const textColor = '#E5E7EB';
+const secondaryTextColor = '#9CA3AF';
+const secondaryAccentColor = '#818CF8';
+
+const styles = StyleSheet.create({
+  safeArea: { flex: 1, backgroundColor: primaryBackgroundColor },
+  fullScreen: { flex: 1 },
+  container: { flex: 1, padding: 16, justifyContent: 'space-between' },
+
+  // --- Home Screen ---
+  homeHeader: { alignItems: 'center', flex: 1, justifyContent: 'center' },
+  mainTitle: { fontSize: 36, fontWeight: 'bold', color: textColor, textAlign: 'center', marginTop: 16 },
+  tagline: { fontSize: 18, color: secondaryTextColor, marginTop: 8, textAlign: 'center' },
+  homeActions: { width: '100%', paddingBottom: 20 },
+  actionCardPrimary: { backgroundColor: accentColor, padding: 24, borderRadius: 16, alignItems: 'center', elevation: 8, shadowColor: accentColor, shadowOpacity: 0.3, shadowRadius: 10 },
+  actionCardTitlePrimary: { color: primaryBackgroundColor, fontSize: 22, fontWeight: 'bold', marginTop: 12 },
+  actionCardSubtitle: { color: '#0891B2', fontSize: 14, marginTop: 4 },
+  actionCardSecondary: { backgroundColor: componentBackgroundColor, padding: 16, borderRadius: 12, alignItems: 'center', marginTop: 16, flexDirection: 'row', justifyContent: 'center', gap: 12},
+  actionCardTitleSecondary: { color: textColor, fontSize: 18, fontWeight: '600' },
+  reportsLink: { flexDirection: 'row', alignItems: 'center', gap: 8, justifyContent: 'center', paddingVertical: 16 },
+  reportsLinkText: { color: secondaryAccentColor, fontSize: 16, fontWeight: '600' },
+  errorText: { backgroundColor: 'rgba(153, 27, 27, 0.5)', color: '#FCA5A5', padding: 12, borderRadius: 8, marginBottom: 16, textAlign: 'center' },
+  
+  // --- Scanner Screen ---
+  scannerOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.6)' },
+  scannerText: { color: textColor, fontSize: 16, marginBottom: 24, paddingHorizontal: 40, textAlign: 'center' },
+  scannerBox: { width: width * 0.75, height: height * 0.25, justifyContent: 'center', alignItems: 'center' },
+  scannerCorner: { position: 'absolute', width: 30, height: 30, borderColor: accentColor, borderWidth: 4 },
+  topLeft: { top: 0, left: 0, borderTopWidth: 4, borderLeftWidth: 4 },
+  topRight: { top: 0, right: 0, borderTopWidth: 4, borderRightWidth: 4 },
+  bottomLeft: { bottom: 0, left: 0, borderBottomWidth: 4, borderLeftWidth: 4 },
+  bottomRight: { bottom: 0, right: 0, borderBottomWidth: 4, borderRightWidth: 4 },
+  scannerLine: { width: '100%', height: 2, backgroundColor: accentColor, elevation: 1, shadowColor: accentColor, shadowOpacity: 1, shadowRadius: 10 },
+  closeButton: { position: 'absolute', top: 60, right: 20, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20, width: 40, height: 40, justifyContent: 'center', alignItems: 'center' },
+  
+  // --- Capture Screen ---
+  flashEffect: { ...StyleSheet.absoluteFillObject, backgroundColor: 'white', opacity: 0 }, // Handled by animation
+  captureOverlay: { flex: 1, justifyContent: 'space-between', padding: 20 },
+  topBar: { flexDirection: 'row', justifyContent: 'center', paddingTop: 40 },
+  taskCodePill: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20 },
+  taskCodeText: { color: textColor, fontSize: 16, fontWeight: 'bold' },
+  bottomBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 20 },
+  utilityButton: { alignItems: 'center', width: 80, gap: 4 },
+  utilityButtonText: { color: textColor, fontSize: 14, fontWeight: '500' },
+  captureButton: { width: 70, height: 70, borderRadius: 35, backgroundColor: 'white', borderWidth: 5, borderColor: accentColor },
+  photoCountContainer: { alignItems: 'center', width: 80 },
+  photoCount: { color: 'white', fontSize: 24, fontWeight: 'bold' },
+  photoCountLabel: { color: '#D1D5DB', fontSize: 14 },
+  
+  // --- Reports Screen ---
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, paddingHorizontal: 0 },
+  backButton: { width: 40, height: 40, justifyContent: 'center', alignItems: 'flex-start' },
+  title: { fontSize: 24, fontWeight: 'bold', color: textColor },
+  dateLabel: { color: secondaryTextColor, marginBottom: 16, fontSize: 16, textAlign: 'center' },
+  reportCard: { backgroundColor: componentBackgroundColor, borderRadius: 12, padding: 16, marginBottom: 12, flexDirection: 'row', alignItems: 'center', gap: 16 },
+  reportCardContent: { flex: 1 },
+  reportCardTitle: { color: secondaryTextColor, fontSize: 14 },
+  reportCardValue: { color: textColor, fontSize: 18, fontWeight: '600' },
+  reportCardCount: { backgroundColor: 'rgba(0,0,0,0.2)', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
+  emptyText: { color: secondaryTextColor, textAlign: 'center', marginTop: 40, fontSize: 16 },
+  fab: { position: 'absolute', bottom: 30, right: 20, backgroundColor: accentColor, width: 120, height: 50, borderRadius: 25, justifyContent: 'center', alignItems: 'center', elevation: 8, shadowColor: accentColor, shadowOpacity: 0.4, shadowRadius: 8 },
+  fabDisabled: { backgroundColor: '#374151' },
+  fabText: { color: primaryBackgroundColor, fontSize: 18, fontWeight: 'bold' },
+
+  // --- Modal ---
+  modalBackdrop: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.7)' },
+  modalContainer: { backgroundColor: componentBackgroundColor, padding: 24, borderRadius: 16, width: '90%', maxWidth: 400 },
+  modalTitle: { color: textColor, fontSize: 20, fontWeight: 'bold', marginBottom: 16, textAlign: 'center' },
+  input: { backgroundColor: '#374151', color: textColor, borderRadius: 8, padding: 12, fontSize: 16, marginBottom: 24, borderWidth: 1, borderColor: '#4B5563' },
+  modalActions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 12 },
+  modalButtonSecondary: { paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8 },
+  modalButtonText: { color: secondaryTextColor, fontSize: 16, fontWeight: '600' },
+  modalButtonPrimary: { backgroundColor: accentColor, paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8 },
+  modalButtonPrimaryText: { color: primaryBackgroundColor, fontSize: 16, fontWeight: '600' },
+});
 
 export default App;
