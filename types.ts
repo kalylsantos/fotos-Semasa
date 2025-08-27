@@ -1,3 +1,4 @@
+
 export enum AppState {
   HOME,
   SCANNING,
@@ -11,6 +12,9 @@ export interface PhotoRecord {
   filename: string;
   timestamp: string;
   data: Blob;
+  latitude?: number; // Optional, in case geolocation fails
+  longitude?: number; // Optional
+  deviceId: string; // Should always be present
 }
 
 export interface TaskReport {

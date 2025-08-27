@@ -11,6 +11,41 @@ import { CameraIcon, BarcodeScannerIcon, PencilSquareIcon, DocumentTextIcon, XMa
 // Initialize the database when the app loads
 initDB();
 
+// --- HELPERS ---
+
+/**
+ * Gets a persistent, anonymous device identifier from local storage, creating one if it doesn't exist.
+ * This helps in tracking which device took which photo.
+ */
+const getDeviceId = (): string => {
+  let deviceId = localStorage.getItem('device-id');
+  if (!deviceId) {
+    // A simple, non-invasive way to generate a unique ID
+    deviceId = `device_${Math.random().toString(36).substring(2, 11)}`;
+    localStorage.setItem('device-id', deviceId);
+  }
+  return deviceId;
+};
+
+/**
+ * Wraps the Geolocation API in a Promise for easier async/await usage.
+ */
+const getCurrentLocation = (): Promise<{ latitude: number; longitude: number }> => {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      return reject(new Error('Geolocation is not supported by your browser.'));
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => resolve({
+        latitude: position.coords.latitude,
+        longitude: position.coords.longitude,
+      }),
+      (error) => reject(error)
+    );
+  });
+};
+
+
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.HOME);
   const [taskCode, setTaskCode] = useState<string>('');
@@ -26,6 +61,7 @@ const App: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const codeReader = useRef(new BrowserMultiFormatReader());
   const streamRef = useRef<MediaStream | null>(null);
+  const deviceIdRef = useRef<string>(getDeviceId()); // Get device ID on initial render
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
@@ -110,6 +146,14 @@ const App: React.FC = () => {
         navigator.vibrate(100);
       }
 
+      let location: { latitude: number; longitude: number } | null = null;
+      try {
+        location = await getCurrentLocation();
+      } catch (geoError) {
+        console.warn('Could not get geolocation:', geoError);
+        // Proceed without location data. The user will see "Location: N/A" on the watermark.
+      }
+
       const video = videoRef.current;
       const canvas = canvasRef.current;
       canvas.width = video.videoWidth;
@@ -121,23 +165,46 @@ const App: React.FC = () => {
 
         const now = new Date();
         const timestamp = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`;
-        const watermarkText = `${taskCode} | ${timestamp}`;
+        const deviceId = deviceIdRef.current;
         
-        const fontSize = Math.max(24, Math.floor(canvas.width / 40));
+        // --- Watermark Rendering ---
+        const fontSize = Math.max(20, Math.floor(canvas.width / 50));
         context.font = `bold ${fontSize}px Inter, sans-serif`;
         context.fillStyle = 'rgba(255, 255, 255, 0.9)';
         context.strokeStyle = 'rgba(0, 0, 0, 0.9)';
         context.lineWidth = 4;
+        
         const x = 20;
-        const y = canvas.height - 20;
-        context.strokeText(watermarkText, x, y);
-        context.fillText(watermarkText, x, y);
+        let y = canvas.height - 20;
+        const lineHeight = fontSize * 1.2;
+
+        const locationLine = location ? `Lat: ${location.latitude.toFixed(5)}, Lon: ${location.longitude.toFixed(5)}` : 'Location: N/A';
+        const timeLine = `Time: ${timestamp}`;
+        const infoLine = `Task: ${taskCode} | Device: ${deviceId}`;
+
+        // Draw lines from bottom up to position them correctly at the bottom-left corner
+        context.strokeText(locationLine, x, y);
+        context.fillText(locationLine, x, y);
+        y -= lineHeight;
+        context.strokeText(timeLine, x, y);
+        context.fillText(timeLine, x, y);
+        y -= lineHeight;
+        context.strokeText(infoLine, x, y);
+        context.fillText(infoLine, x, y);
 
         canvas.toBlob(async (blob) => {
           if (blob) {
             const photoIndex = photos.length + 1;
             const filename = `${taskCode}_(${photoIndex}).jpg`;
-            const newRecord: PhotoRecord = { taskCode, filename, timestamp: now.toISOString(), data: blob };
+            const newRecord: PhotoRecord = { 
+                taskCode, 
+                filename, 
+                timestamp: now.toISOString(), 
+                data: blob,
+                deviceId: deviceId,
+                latitude: location?.latitude,
+                longitude: location?.longitude
+            };
             await addPhoto(newRecord);
             setPhotos(prevPhotos => [...prevPhotos, newRecord]);
           }
@@ -244,8 +311,9 @@ const App: React.FC = () => {
             <h2 className="text-xl font-semibold mb-2 text-center flex-shrink-0">Task Code: <span className="text-cyan-400">{taskCode}</span></h2>
             <div className="relative flex-grow aspect-video bg-slate-900 rounded-xl overflow-hidden border-2 border-slate-700 mb-4">
                 <video ref={videoRef} playsInline className="w-full h-full object-cover"></video>
+                <canvas ref={canvasRef} className="hidden"></canvas>
                 {/* Shutter flash effect */}
-                <div className={`absolute inset-0 bg-white transition-opacity duration-200 ${isCapturing ? 'opacity-70' : 'opacity-0'}`}></div>
+                <div className={`absolute inset-0 bg-white transition-opacity duration-200 ${isCapturing ? 'opacity-70' : 'opacity-0'} pointer-events-none`}></div>
             </div>
             <div className="flex-shrink-0 flex justify-around items-center gap-4">
                 <button onClick={() => { setTaskCode(''); setPhotos([]); setAppState(AppState.HOME); }} className="bg-slate-600 text-white font-semibold px-4 py-3 rounded-lg flex items-center gap-2">
